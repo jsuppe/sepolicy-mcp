@@ -282,41 +282,212 @@ def _find_compiled_policy(tree: str) -> str | None:
     return None
 
 
-def check_neverallow_internal(d: Denial, tree: str) -> str | None:
-    """Check if proposed allow rule would violate existing neverallows.
+# --- Neverallow source parsing ---
+# Strategy: grep neverallow blocks from system/sepolicy/*.te source files,
+# parse the (source_set, target_set, classes, perms), then match proposed
+# allow rule against each. We do text-level matching — not full attribute
+# expansion (that needs setools/sesearch). Catches direct type references
+# and "domain" attribute conflicts, which is most real-world neverallows.
 
-    Strategy: frame the proposed rule AS a neverallow, run sepolicy-analyze.
-    If tool finds the policy already has matching allow patterns elsewhere,
-    fine. But if neverallows exist that cover (s,t,class,perm), the build
-    would reject — detect via string match on neverallow dump.
+NEVERALLOW_RE = re.compile(r"^neverallow\s+(.*?);", re.DOTALL | re.MULTILINE)
 
-    Current impl: runs -n with rule formatted as neverallow test. Non-empty
-    output means policy violates our hypothetical neverallow (i.e. allows
-    exist), which doesn't directly tell us about AOSP's neverallows. This
-    is a scaffold; proper impl parses system/sepolicy/public/*.te for
-    neverallow rules and pattern-matches against the proposed rule.
+_NEVERALLOW_CACHE: dict = {}
 
-    TODO: parse actual neverallow rules from source tree and match locally.
+
+def _load_neverallows(tree: str) -> list[dict]:
+    """Read all .te files under system/sepolicy/ and parse neverallow stmts.
+    Caches per tree. Skips rules with m4 macros ($1, $2) — those are templates."""
+    if tree in _NEVERALLOW_CACHE:
+        return _NEVERALLOW_CACHE[tree]
+    if tree not in TREES:
+        return []
+    rules = []
+    root = os.path.join(TREES[tree], "system", "sepolicy")
+    if not os.path.isdir(root):
+        _NEVERALLOW_CACHE[tree] = []
+        return []
+    for dirpath, _, files in os.walk(root):
+        for fn in files:
+            if not fn.endswith(".te"):
+                continue
+            path = os.path.join(dirpath, fn)
+            try:
+                with open(path, errors="replace") as f:
+                    text = f.read()
+            except Exception:
+                continue
+            # Strip comments
+            text = re.sub(r"#[^\n]*", "", text)
+            for m in NEVERALLOW_RE.finditer(text):
+                body = re.sub(r"\s+", " ", m.group(1)).strip()
+                if "$1" in body or "$2" in body:
+                    continue  # m4 template
+                parsed = _parse_neverallow_body(body)
+                if parsed:
+                    parsed["file"] = os.path.relpath(path, TREES[tree])
+                    rules.append(parsed)
+    _NEVERALLOW_CACHE[tree] = rules
+    return rules
+
+
+def _parse_set(s: str) -> tuple:
+    """Parse '{ a b -c }' or 'a' → (includes, excludes, is_wildcard)."""
+    s = s.strip()
+    if s == "*":
+        return (set(), set(), True)
+    if s.startswith("{") and s.endswith("}"):
+        s = s[1:-1]
+    tokens = s.split()
+    inc, exc = set(), set()
+    for t in tokens:
+        t = t.strip()
+        if not t:
+            continue
+        if t.startswith("-"):
+            exc.add(t[1:])
+        else:
+            inc.add(t)
+    return (inc, exc, False)
+
+
+def _parse_neverallow_body(body: str) -> dict | None:
+    """Parse 'source target:class perms' from neverallow body."""
+    # Find ':' splitting target from class
+    # source may contain { } with spaces, target may too
+    # Approach: match balanced braces
+    def extract_set(text: str, i: int) -> tuple:
+        while i < len(text) and text[i] == " ":
+            i += 1
+        if i >= len(text):
+            return (None, i)
+        if text[i] == "{":
+            depth = 0
+            start = i
+            while i < len(text):
+                if text[i] == "{":
+                    depth += 1
+                elif text[i] == "}":
+                    depth -= 1
+                    if depth == 0:
+                        return (text[start:i+1], i+1)
+                i += 1
+            return (None, i)
+        # Single token until space or :
+        start = i
+        while i < len(text) and text[i] not in " :":
+            i += 1
+        return (text[start:i], i)
+
+    src, i = extract_set(body, 0)
+    if src is None:
+        return None
+    tgt, i = extract_set(body, i)
+    if tgt is None:
+        return None
+    while i < len(body) and body[i] == " ":
+        i += 1
+    if i >= len(body) or body[i] != ":":
+        return None
+    i += 1
+    classes, i = extract_set(body, i)
+    perms, _ = extract_set(body, i)
+    if classes is None or perms is None:
+        return None
+    return {
+        "src": _parse_set(src),
+        "tgt": _parse_set(tgt),
+        "classes": _parse_set(classes),
+        "perms": _parse_set(perms),
+        "raw": body,
+    }
+
+
+# Known permission set aliases (common ones; full list in global_macros)
+PERM_ALIASES = {
+    "no_rw_file_perms": {"read", "write", "append", "open"},
+    "no_w_file_perms": {"write", "append"},
+    "no_x_file_perms": {"execute", "execute_no_trans", "execmod"},
+    "rw_file_perms": {"read", "write", "open", "getattr", "lock", "ioctl"},
+    "r_file_perms": {"read", "open", "getattr", "lock", "ioctl"},
+    "w_file_perms": {"write", "open", "getattr", "lock", "append"},
+    "*": None,  # wildcard, matches all
+}
+
+
+def _set_matches(parsed_set: tuple, value: str, attrs: set = None) -> bool:
+    """Check if value is in parsed_set. attrs = known attributes containing value."""
+    inc, exc, wildcard = parsed_set
+    attrs = attrs or set()
+    if value in exc:
+        return False
+    for a in attrs:
+        if a in exc:
+            return False
+    if wildcard:
+        return True
+    if value in inc:
+        return True
+    if inc & attrs:
+        return True
+    return False
+
+
+# Coarse attribute map — true resolution needs compiled policy. These cover
+# the most common neverallow attribute references.
+COMMON_ATTRS = {
+    "domain": lambda t: True,  # all subject types are domains
+    "file_type": lambda t: t.endswith("_file") or t.endswith("_data_file"),
+    "coredomain": lambda t: False,  # conservative: unknown
+    "appdomain": lambda t: "_app" in t or t in {"untrusted_app", "priv_app", "platform_app"},
+    "untrusted_app_all": lambda t: t.startswith("untrusted_app"),
+}
+
+
+def _attrs_for(t: str) -> set:
+    return {name for name, pred in COMMON_ATTRS.items() if pred(t)}
+
+
+def _perms_match(parsed_perms: tuple, perm: str) -> bool:
+    inc, exc, wildcard = parsed_perms
+    if wildcard:
+        return True
+    # Expand aliases
+    expanded = set()
+    for p in inc:
+        if p in PERM_ALIASES and PERM_ALIASES[p]:
+            expanded |= PERM_ALIASES[p]
+        else:
+            expanded.add(p)
+    if perm in exc:
+        return False
+    return perm in expanded
+
+
+def check_neverallow_internal(d: Denial, tree: str):
+    """Match proposed allow against source-parsed neverallows.
+    Returns None if no conflict, else description string listing violations.
     """
-    analyze = _find_sepolicy_analyze(tree)
-    policy = _find_compiled_policy(tree)
-    if not analyze or not policy:
+    rules = _load_neverallows(tree)
+    if not rules:
         return None
-    # Framed as neverallow test — reports policy rules that would break it
-    rule = f"neverallow {d.scontext} {d.tcontext}:{d.tclass} {{ {' '.join(d.perms)} }};"
-    try:
-        proc = subprocess.run(
-            [analyze, policy, "neverallow", "-n", rule],
-            capture_output=True, text=True, timeout=15,
-        )
-        out = proc.stdout.strip()
-        err = proc.stderr.strip()
-        if "Error while parsing" in out or "Error while parsing" in err:
-            return None  # Syntax issue with our synthetic rule; skip
-        if out:
-            return f"Policy has existing allow(s): {out[:500]}"
-    except Exception:
-        return None
+    src_attrs = _attrs_for(d.scontext)
+    tgt_attrs = _attrs_for(d.tcontext)
+    violations = []
+    for rule in rules:
+        if not _set_matches(rule["src"], d.scontext, src_attrs):
+            continue
+        if not _set_matches(rule["tgt"], d.tcontext, tgt_attrs):
+            continue
+        if not _set_matches(rule["classes"], d.tclass):
+            continue
+        for perm in d.perms:
+            if _perms_match(rule["perms"], perm):
+                violations.append(f"  {rule['file']}: neverallow {rule['raw'][:200]}")
+                break
+        if len(violations) >= 3:
+            break
+    if violations:
+        return "Matches existing neverallow(s):\n" + "\n".join(violations)
     return None
 
 

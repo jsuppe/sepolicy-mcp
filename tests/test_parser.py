@@ -2,7 +2,10 @@ import os
 import sys
 sys.path.insert(0, os.path.join(os.path.dirname(__file__), ".."))
 
-from sepolicy_mcp.server import parse_denials_raw, suggest_macro, Denial
+from sepolicy_mcp.server import (
+    parse_denials_raw, suggest_macro, Denial,
+    _parse_neverallow_body, _parse_set, _set_matches, _perms_match,
+)
 
 FIXTURES = os.path.join(os.path.dirname(__file__), "fixtures")
 
@@ -52,6 +55,46 @@ def test_rw_dir_file():
     assert macro == "rw_dir_file(vcam_hal, shell_data_file)"
 
 
+def test_parse_neverallow_simple():
+    r = _parse_neverallow_body("untrusted_app shell_data_file:file { read write }")
+    assert r is not None
+    assert "untrusted_app" in r["src"][0]
+    assert "shell_data_file" in r["tgt"][0]
+    assert "file" in r["classes"][0]
+    assert {"read", "write"}.issubset(r["perms"][0])
+
+
+def test_parse_neverallow_set_with_exclusions():
+    r = _parse_neverallow_body("{ domain -init } self:capability *")
+    assert "domain" in r["src"][0]
+    assert "init" in r["src"][1]  # excluded
+    assert r["perms"][2] is True  # wildcard
+
+
+def test_parse_neverallow_wildcards():
+    r = _parse_neverallow_body("appdomain *:process ptrace")
+    assert r["tgt"][2] is True  # wildcard target
+
+
+def test_set_matches_wildcard():
+    s = _parse_set("*")
+    assert _set_matches(s, "anything") is True
+
+
+def test_set_matches_excludes():
+    s = _parse_set("{ a b -c }")
+    assert _set_matches(s, "a") is True
+    assert _set_matches(s, "c") is False
+    assert _set_matches(s, "d") is False
+
+
+def test_perms_match_alias():
+    p = _parse_set("no_rw_file_perms")
+    assert _perms_match(p, "read") is True
+    assert _perms_match(p, "write") is True
+    assert _perms_match(p, "execute") is False
+
+
 def test_no_macro_for_unknown():
     d = Denial("vcam_hal", "random_t", "capability", ("sys_admin",), 1, set(), set())
     macro, _ = suggest_macro(d)
@@ -67,4 +110,10 @@ if __name__ == "__main__":
     test_net_domain()
     test_rw_dir_file()
     test_no_macro_for_unknown()
+    test_parse_neverallow_simple()
+    test_parse_neverallow_set_with_exclusions()
+    test_parse_neverallow_wildcards()
+    test_set_matches_wildcard()
+    test_set_matches_excludes()
+    test_perms_match_alias()
     print("OK")
