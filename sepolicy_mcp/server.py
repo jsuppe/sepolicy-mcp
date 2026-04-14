@@ -271,6 +271,8 @@ def _find_compiled_policy(tree: str) -> str | None:
     if tree not in OUT_DIRS:
         return None
     candidates = [
+        f"{OUT_DIRS[tree]}/target/product/vsoc_x86_64_only/odm/etc/selinux/precompiled_sepolicy",
+        f"{OUT_DIRS[tree]}/target/product/vsoc_x86_64/odm/etc/selinux/precompiled_sepolicy",
         f"{OUT_DIRS[tree]}/target/product/generic/root/sepolicy",
         f"{OUT_DIRS[tree]}/target/product/vsoc_x86_64/root/sepolicy",
     ]
