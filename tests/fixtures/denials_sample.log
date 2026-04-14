@@ -1,0 +1,5 @@
+[   12.345678] type=1400 audit(1234567890.123:45): avc: denied { call } for pid=1234 comm="vcam_hal" scontext=u:r:vcam_hal:s0 tcontext=u:r:system_server:s0 tclass=binder permissive=0
+[   12.345679] type=1400 audit(1234567890.124:46): avc: denied { call } for pid=1234 comm="vcam_hal" scontext=u:r:vcam_hal:s0 tcontext=u:r:system_server:s0 tclass=binder permissive=0
+[   12.345680] type=1400 audit(1234567890.125:47): avc: denied { transfer } for pid=1234 comm="vcam_hal" scontext=u:r:vcam_hal:s0 tcontext=u:r:system_server:s0 tclass=binder permissive=0
+[   13.001234] type=1400 audit(1234567891.001:48): avc: denied { read write } for pid=1235 comm="vcam_hal" scontext=u:r:vcam_hal:s0 tcontext=u:object_r:shell_data_file:s0 tclass=sock_file permissive=0
+[   13.001235] type=1400 audit(1234567891.002:49): avc: denied { connectto } for pid=1235 comm="vcam_hal" scontext=u:r:vcam_hal:s0 tcontext=u:r:shell:s0 tclass=unix_stream_socket permissive=0
