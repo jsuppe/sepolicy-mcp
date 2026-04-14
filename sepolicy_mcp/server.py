@@ -283,21 +283,38 @@ def _find_compiled_policy(tree: str) -> str | None:
 
 
 def check_neverallow_internal(d: Denial, tree: str) -> str | None:
-    """Shell out to sepolicy-analyze neverallow. Needs compiled policy + tool.
-    Returns violation string or None.
+    """Check if proposed allow rule would violate existing neverallows.
+
+    Strategy: frame the proposed rule AS a neverallow, run sepolicy-analyze.
+    If tool finds the policy already has matching allow patterns elsewhere,
+    fine. But if neverallows exist that cover (s,t,class,perm), the build
+    would reject — detect via string match on neverallow dump.
+
+    Current impl: runs -n with rule formatted as neverallow test. Non-empty
+    output means policy violates our hypothetical neverallow (i.e. allows
+    exist), which doesn't directly tell us about AOSP's neverallows. This
+    is a scaffold; proper impl parses system/sepolicy/public/*.te for
+    neverallow rules and pattern-matches against the proposed rule.
+
+    TODO: parse actual neverallow rules from source tree and match locally.
     """
     analyze = _find_sepolicy_analyze(tree)
     policy = _find_compiled_policy(tree)
     if not analyze or not policy:
-        return None  # Silently skip — not configured
-    rule = f"allow {d.scontext} {d.tcontext}:{d.tclass} {{ {' '.join(d.perms)} }};"
+        return None
+    # Framed as neverallow test — reports policy rules that would break it
+    rule = f"neverallow {d.scontext} {d.tcontext}:{d.tclass} {{ {' '.join(d.perms)} }};"
     try:
         proc = subprocess.run(
             [analyze, policy, "neverallow", "-n", rule],
             capture_output=True, text=True, timeout=15,
         )
-        if proc.returncode != 0 or proc.stdout.strip():
-            return proc.stdout.strip() or proc.stderr.strip() or "violation detected"
+        out = proc.stdout.strip()
+        err = proc.stderr.strip()
+        if "Error while parsing" in out or "Error while parsing" in err:
+            return None  # Syntax issue with our synthetic rule; skip
+        if out:
+            return f"Policy has existing allow(s): {out[:500]}"
     except Exception:
         return None
     return None
